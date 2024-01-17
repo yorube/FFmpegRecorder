@@ -1,9 +1,5 @@
 ﻿using System;
-using System.Collections;
-using System.Collections.Generic;
 using System.IO;
-using UnityEditor.Recorder;
-using UnityEngine;
 
 namespace Ruccho.FFmpegRecorder
 {
@@ -33,6 +29,7 @@ namespace Ruccho.FFmpegRecorder
             };
 
             FFmpeg = System.Diagnostics.Process.Start(psi);
+            
         }
 
         public void Dispose()

@@ -3,7 +3,9 @@ using System.IO;
 using System.Threading;
 using Unity.Collections;
 using UnityEditor;
+using UnityEditor.Media;
 using UnityEditor.Recorder;
+using UnityEditor.Recorder.Encoder;
 using UnityEditor.Recorder.Input;
 using UnityEngine;
 using UnityEngine.Rendering;
@@ -13,7 +15,9 @@ namespace Ruccho.FFmpegRecorder
 {
     public class FFmpegRecorder : BaseTextureRecorder<FFmpegRecorderSettings>
     {
-        protected override TextureFormat ReadbackTextureFormat => TextureFormat.RGBA32;
+        protected override TextureFormat ReadbackTextureFormat => Settings.GetTextureFormat(
+            Settings.CaptureAlpha && Settings.CanCaptureAlpha &&
+            Settings.ImageInputSettings.SupportsTransparent);
 
         private string AbsoluteFilename { get; set; }
 
@@ -76,8 +80,7 @@ namespace Ruccho.FFmpegRecorder
             AudioInputMainBufferGet = audioInputMainBufferGetEx.Compile();
 #endif
         }
-
-
+        
         protected override bool BeginRecording(RecordingSession session)
         {
             if (!base.BeginRecording(session))
@@ -110,37 +113,29 @@ namespace Ruccho.FFmpegRecorder
                 return false;
             }
 
-            int audioInputSampleRate;
-            ushort audioInputChannelCount;
-
-            // from Unity Recorder 4.0.0, AudioInput
-
-#if UNITY_RECORDER_4_OR_NEWER
-            audioInputSampleRate = AudioInput.SampleRate;
-            audioInputChannelCount = AudioInput.ChannelCount;
-#else
-            audioInputSampleRate = (int) audioInputType.GetProperty("sampleRate").GetValue(audioInput);
-            audioInputChannelCount = (ushort) audioInputType.GetProperty("channelCount").GetValue(audioInput);
-#endif
-
             WarmupAudioBufferAccess();
 
             try
             {
-                AbsoluteFilename = Settings.FileNameGenerator.BuildAbsolutePath(session);
-                //Check project audioManager setting is disable(e g someproject using other audio system it will be disable)
+                //Check project audioManager setting is disable(e.g some project using other audio system it will be disable)
                 //This prevent crash when CreateAudioProcess but audio setting is disabled.
                 var audioManager = AssetDatabase.LoadAllAssetsAtPath("ProjectSettings/AudioManager.asset")[0];
                 var serializedManager = new SerializedObject(audioManager);
-                var disableAudioProp = serializedManager.FindProperty("m_DisableAudio");
-                bool mux = Settings.AudioInputSettings.PreserveAudio || disableAudioProp.boolValue;
+                var isProjectSettingsDisableAudio = serializedManager.FindProperty("m_DisableAudio").boolValue;
 
-                CreateVideoProcess(width, height, RationalFromDouble(session.settings.FrameRate), AbsoluteFilename,
-                    !mux);
-
+                bool mux = !Settings.CanCaptureAudio || isProjectSettingsDisableAudio;
+                var frameRate = session.settings.FrameRatePlayback == FrameRatePlayback.Constant
+                    ? FFmpegRecorderUtil.RationalFromDouble(session.settings.FrameRate)
+                    : new MediaRational { numerator = 0, denominator = 0 };
+                // Get a recording context
+                var recordingContext = Settings.GetRecordingContext();
+                // Set locally determined fields
+                recordingContext.path = Settings.FileNameGenerator.BuildAbsolutePath(session);
+                recordingContext.fps = frameRate;
+                CreateVideoProcess(recordingContext, !mux);
                 if (mux)
                 {
-                    CreateAudioProcess(AbsoluteFilename, audioInputSampleRate, audioInputChannelCount);
+                    CreateAudioProcess(recordingContext.path);
                 }
 
                 return true;
@@ -154,41 +149,59 @@ namespace Ruccho.FFmpegRecorder
 
         private FFmpegHost videoProcess;
 
-        private void CreateVideoProcess(int width, int height, Rational frameRate, string outputPath,
-            bool withoutMux = false)
+        private void CreateVideoProcess(RecordingContext context, bool withoutMux = false)
         {
             videoProcess?.Dispose();
+            var pixel = Settings.GetPixelFormat(context.doCaptureAlpha);
+
             var videoBitrate = Settings.VideoBitrate <= 0
                 ? ""
                 : $" -b:v {Mathf.Clamp(Settings.VideoBitrate * 1000, 0, float.PositiveInfinity)}";
             var videoCodec = string.IsNullOrEmpty(Settings.VideoCodec) ? "" : $" -c:v {Settings.VideoCodec}";
+            var arguments = "-y -f rawvideo -vcodec rawvideo"
+                            + " -pixel_format " + pixel
+                            + " -colorspace bt709"
+                            + " -video_size " + context.width + "x" + context.height
+                            + " -framerate " + (float)FFmpegRecorderUtil.DoubleFromRational(context.fps)
+                            + " -loglevel error -i - "
+                            + videoBitrate
+                            + videoCodec
+                            + $" {Settings.VideoArguments}"
+                            + (withoutMux
+                                ? $" \"{context.path}\""
+                                : $" \"{context.path.Split('.')[0]}_video.{Settings.OutputExtension}\"");
             videoProcess = new FFmpegHost(
                 Settings.FFmpegExecutablePath,
-                "-y -f rawvideo -vcodec rawvideo -pixel_format rgba"
-                + " -video_size " + width + "x" + height
-                + " -framerate " + frameRate
-                + " -loglevel error -i - " + "-pix_fmt yuv420p"
-                + videoBitrate
-                + videoCodec
-                + $" {Settings.VideoArguments}"
-                + (withoutMux ? $" \"{outputPath}\"" : $" \"{outputPath}_video.{Settings.OutputExtension}\""));
+                arguments);
         }
 
         private FFmpegHost audioProcess;
 
-        private void CreateAudioProcess(string outputPath, int sampleRate, int channelCount)
+        private void CreateAudioProcess(string outputPath)
         {
             audioProcess?.Dispose();
+
+            // from Unity Recorder 4.0.0, AudioInput
+            int audioOutputSampleRate;
+            ushort audioOutputChannelCount;
+
+#if UNITY_RECORDER_4_OR_NEWER
+            audioOutputSampleRate = new MediaRational(AudioSettings.outputSampleRate).numerator;
+            audioOutputChannelCount = AudioInput.ChannelCount;
+#else
+            audioInputSampleRate = (int) audioInputType.GetProperty("sampleRate").GetValue(audioInput);
+            audioInputChannelCount = (ushort) audioInputType.GetProperty("channelCount").GetValue(audioInput);
+#endif
+
             var audioCodec = string.IsNullOrEmpty(Settings.AudioCodec) ? "" : $" -acodec {Settings.AudioCodec}";
-            audioProcess = new FFmpegHost(
-                Settings.FFmpegExecutablePath,
-                $"-y -f f32le -ar {sampleRate} -ac {channelCount}"
+            var audioArguments =
+                $"-y -f f32le -ar {audioOutputSampleRate} -ac {audioOutputChannelCount}"
                 + " -loglevel error -i - "
                 + audioCodec
-                + $" -ar {sampleRate} -ac {channelCount}"
+                + $" -ar {audioOutputSampleRate} -ac {audioOutputChannelCount}"
                 + $" {Settings.AudioArguments}"
-                //+ $" -map 0:0 -f data"
-                + $" \"{outputPath}_audio.{Settings.OutputExtension}\"");
+                + $" \"{outputPath}_audio.{Settings.OutputExtension}\"";
+            audioProcess = new FFmpegHost(Settings.FFmpegExecutablePath, audioArguments);
         }
 
         private byte[] nativeArrayBuffer;
@@ -375,45 +388,6 @@ namespace Ruccho.FFmpegRecorder
                 audioProcess?.Dispose();
                 videoProcess = null;
                 audioProcess = null;
-            }
-        }
-
-        static long GreatestCommonDivisor(long a, long b)
-        {
-            if (a == 0)
-                return b;
-
-            if (b == 0)
-                return a;
-
-            return (a < b) ? GreatestCommonDivisor(a, b % a) : GreatestCommonDivisor(b, a % b);
-        }
-
-        private static Rational RationalFromDouble(double value)
-        {
-            var integral = Math.Floor(value);
-            var frac = value - integral;
-
-            const long precision = 10000000;
-
-            var gcd = GreatestCommonDivisor((long)Math.Round(frac * precision), precision);
-            var denom = precision / gcd;
-
-            return new Rational()
-            {
-                numerator = (int)((long)integral * denom + ((long)Math.Round(frac * precision)) / gcd),
-                denominator = (int)denom
-            };
-        }
-
-        public struct Rational
-        {
-            public int numerator;
-            public int denominator;
-
-            public override string ToString()
-            {
-                return $"{numerator}/{denominator}";
             }
         }
     }
